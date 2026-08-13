@@ -43,7 +43,7 @@ The workflow has three parts:
 
 The mechanism above only works if users actually request the license on their `sbatch` command line. Nothing in Slurm stops a user from forgetting `--licenses=ibm_kingston@slurmdb:1` — in which case the job just runs immediately without waiting for the backend, defeating the purpose of the license.
 
-To close that gap, the `plugins/` directory contains a Slurm [`job_submit` plugin](https://slurm.schedmd.com/job_submit_plugins.html) that checks, at submission time, whether a job requests the required `--licenses` option. If it doesn't, the plugin rejects the job and returns an error prompting the user to add the option, rather than letting it run without coordinating with the quantum backend.
+To close that gap, the [`plugins/`](./plugins) directory contains a Slurm [Job Submit Plugin](https://slurm.schedmd.com/job_submit_plugins.html) that checks, at submission time, whether a job requests the required `--licenses` option. If it doesn't, the plugin rejects the job and returns an error prompting the user to add the option, rather than letting it run without coordinating with the quantum backend.
 
 See the [Slurm documentation](https://slurm.schedmd.com/job_submit_plugins.html) for how to install and enable a `job_submit` plugin on your cluster.
 
