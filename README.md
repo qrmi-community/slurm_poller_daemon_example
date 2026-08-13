@@ -28,7 +28,11 @@ The workflow has three parts:
 2. **`slurm_license_poller` runs as a daemon on one node in the cluster**, acting as the external license manager. It monitors each configured quantum backend, and when a backend becomes ready to execute jobs (its pending job count reaches zero), it uses the `sacctmgr` CLI to release the license by setting the consumed count back to `0`:
 
    ```bash
+   # Quantum backend is READY to accept the jobs
    sacctmgr -i update resource ibm_kingston set lastconsumed=0
+
+   # Quantum backend is BUSY
+   sacctmgr -i update resource ibm_kingston set lastconsumed=1
    ```
 
 3. **Users request the license in their `sbatch` invocation**:
