@@ -1,11 +1,15 @@
 # slurm_license_poller(slp)
-A poller daemon to update Slurm dynamic licenses based on the current status of IQP backends
 
-## Simple Setup, Minimal Overhead
+A poller daemon to update Slurm dynamic licenses based on the current status of IQP backends.
 
-### 1. Define one license per quantum backend
+It provides a reference implementation of the Sensor pattern, in which the state of a quantum system is monitored and fed into Slurm's scheduling decisions through the Dynamic License mechanism. The sample demonstrates how Slurm scheduling can be coordinated with external quantum resource availability. When the quantum resource is occupied by another user, Slurm keeps the job in the PENDING state rather than allocating compute resources that would otherwise sit idle while waiting for quantum execution. 
 
-No changes to slurm.conf — no cluster restart required
+Resources can be configured to require a license before a job may proceed; the scheduler checks license availability during the Schedule state. If the license cannot be acquired, the job remains pending until it becomes available.
+Dynamic Licenses, available since Slurm v23, allow an external license manager to control the license count at runtime.
+
+This mechanism enables the following workflow:
+
+- Define one license per quantum backend. No changes to slurm.conf — no cluster restart required
 
 ```bash
 sacctmgr add resource name=ibm_kingston \
@@ -20,11 +24,20 @@ scontrol show license
 sacctmgr show resource withcluster
 ```
 
-### 2. Run the Poller daemon on any single node in the cluster
-Refer below section.
+- A daemon process runs on one node in the cluster, acting as an external license manager. It monitors the quantum backend and, when the backend becomes ready to execute jobs (i.e., its pending job count reaches zero), uses the sacctmgr CLI to increment the Dynamic License count from 1 to 0.
 
-### 3. Optional job submit plugin adds automatic sbatch options and error handling
-Code is available in the [directory](./plugins/).
+```bash
+sacctmgr -i update resource ibm_kingston set lastconsumed=0
+```
+
+- Users add a license requirement to their sbatch invocations.
+
+```bash
+sbatch --licenses=ibm_kingston@slurmdb:1 run_sampler.sh
+```
+
+The Slurm scheduler checks the Dynamic License count and, when available, allocates GPU and other resources and transitions the job to the Execute state.
+
 
 ## Set up Python virtual development environment
 
