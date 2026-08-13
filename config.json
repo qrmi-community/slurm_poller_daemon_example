@@ -1,0 +1,9 @@
+{
+  "api_token": "<your token>",
+  "service_crn": "<your IQP instance>",
+  "backends": [
+    "ibm_kingston"
+  ],
+  "poll_interval": 30,
+  "cluster_name": "<your slurm cluster name>"
+}

@@ -1,0 +1,36 @@
+[project]
+name = "slurm-license-poller"
+version = "0.1.0"
+dependencies = [
+  "qiskit-ibm-runtime",
+]
+requires-python = ">= 3.11"
+authors = [
+  {name = "Munetaka Ohtani", email = "ohtanim@jp.ibm.com"},
+]
+maintainers = [
+  {name = "Munetaka Ohtani", email = "ohtanim@jp.ibm.com"},
+]
+description = "A poller daemon to update Slurm dynamic licenses based on the current status of IQP backends"
+readme = "README.md"
+license = "Apache-2.0"
+keywords = ["slurm", "qiskit", "qiskit-ibm-runtime"]
+classifiers = [
+  "Environment :: Console",
+  "Operating System :: POSIX :: Linux",
+  "Topic :: Scientific/Engineering :: Quantum Computing",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+]
+
+[project.scripts]
+slurm-license-poller = "slurm_license_poller.main:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "black",
+    "ruff"
+]
