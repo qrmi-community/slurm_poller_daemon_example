@@ -39,6 +39,14 @@ The workflow has three parts:
 
    The Slurm scheduler checks the Dynamic License count and, once it's available, allocates GPU and other resources and transitions the job to the `Execute` state.
 
+## (Optional) Job submit plugin (`plugins/`)
+
+The mechanism above only works if users actually request the license on their `sbatch` command line. Nothing in Slurm stops a user from forgetting `--licenses=ibm_kingston@slurmdb:1` — in which case the job just runs immediately without waiting for the backend, defeating the purpose of the license.
+
+To close that gap, the `plugins/` directory contains a Slurm [`job_submit` plugin](https://slurm.schedmd.com/job_submit_plugins.html) that checks, at submission time, whether a job requests the required `--licenses` option. If it doesn't, the plugin rejects the job and returns an error prompting the user to add the option, rather than letting it run without coordinating with the quantum backend.
+
+See the [Slurm documentation](https://slurm.schedmd.com/job_submit_plugins.html) for how to install and enable a `job_submit` plugin on your cluster.
+
 ## Installation
 
 slp requires a Python virtual environment (venv or Conda), which isolates development from system-wide packages and makes it easy to maintain multiple environments — e.g. one per supported Python version.
