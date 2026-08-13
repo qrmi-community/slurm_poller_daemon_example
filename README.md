@@ -2,11 +2,11 @@
 
 A poller daemon that updates Slurm dynamic licenses based on the current status of IBM Quantum Platform (IQP) backends.
 
-It provides a reference implementation of the **Sensor pattern**: the state of a quantum system is monitored and fed into Slurm's scheduling decisions through Slurm's Dynamic License mechanism. This demonstrates how Slurm scheduling can be coordinated with external quantum resource availability — when a quantum backend is occupied by another user, Slurm keeps the job in the `PENDING` state instead of allocating compute resources that would otherwise sit idle while waiting for quantum execution.
+It provides a reference implementation of the **Sensor pattern**: the state of a quantum system is monitored and fed into Slurm's scheduling decisions through [Slurm's Dynamic License mechanism](https://slurm.schedmd.com/licenses.html#dynamic_licenses). This demonstrates how Slurm scheduling can be coordinated with external quantum resource availability — when a quantum backend is occupied by another user, Slurm keeps the job in the `PENDING` state instead of allocating compute resources that would otherwise sit idle while waiting for quantum execution.
 
 ## How it works
 
-Slurm resources can be configured to require a license before a job may proceed. The scheduler checks license availability during the `Schedule` state; if the license can't be acquired, the job stays pending until it becomes available. **Dynamic Licenses** (available since Slurm v23) let an external license manager control the license count at runtime — which is exactly the role this daemon plays for quantum backends.
+Slurm resources can be configured to require a license before a job may proceed. The scheduler checks license availability during the `Schedule` state; if the license can't be acquired, the job stays pending until it becomes available. **Dynamic Licenses** (available since Slurm v23.03) let an external license manager control the license count at runtime — which is exactly the role this daemon plays for quantum backends.
 
 The workflow has three parts:
 
