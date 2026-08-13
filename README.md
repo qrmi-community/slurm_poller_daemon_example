@@ -1,6 +1,31 @@
 # slurm_license_poller(slp)
 A poller daemon to update Slurm dynamic licenses based on the current status of IQP backends
 
+## Simple Setup, Minimal Overhead
+
+### 1. Define one license per quantum backend
+
+No changes to slurm.conf — no cluster restart required
+
+```bash
+sacctmgr add resource name=ibm_kingston \
+    count=1 \
+    cluster=<your cluster name(e.g. linux) \
+    allowed=100 \
+    type=license
+
+sacctmgr -i update resource <your IQP backend, e.g. ibm_kingston> set lastconsumed=1
+
+scontrol show license
+sacctmgr show resource withcluster
+```
+
+### 2. Run the Poller daemon on any single node in the cluster
+Refer below section.
+
+### 3. Optional job submit plugin adds automatic sbatch options and error handling
+Code is available in the [directory](./plugins/).
+
 ## Set up Python virtual development environment
 
 Virtual environments are used for slp development to isolate the development environment
