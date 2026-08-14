@@ -1,8 +1,9 @@
 {
+  "type": "ibm-quantum-compute",
   "api_token": "<your token>",
-  "service_crn": "<your IQP instance>",
+  "service_crn": "<your instance>",
   "backends": [
-    "ibm_kingston"
+    "ibm_rensselaer"
   ],
   "poll_interval": 30,
   "cluster_name": "<your slurm cluster name>"

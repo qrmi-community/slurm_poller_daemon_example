@@ -1,8 +1,11 @@
 # slurm_license_poller (slp)
 
-A poller daemon that updates Slurm dynamic licenses based on the current status of IBM Quantum Platform (IQP) backends.
+A poller daemon that updates Slurm dynamic license counts based on the current status of IBM Quantum backends.
 
 It provides a reference implementation of the **Sensor pattern**: the state of a quantum system is monitored and fed into Slurm's scheduling decisions through [Slurm's Dynamic License mechanism](https://slurm.schedmd.com/licenses.html#dynamic_licenses). This demonstrates how Slurm scheduling can be coordinated with external quantum resource availability — when a quantum backend is occupied by another user, Slurm keeps the job in the `PENDING` state instead of allocating compute resources that would otherwise sit idle while waiting for quantum execution.
+
+Both the IBM Quantum Compute Service and the IBM Quantum System Service are supported.
+
 
 ## How it works
 
@@ -80,6 +83,7 @@ pip install -U pip
 Install slp along with the standard developer dependencies (testing, docs, linting):
 
 ```bash
+cd poller
 pip install .
 ```
 
@@ -88,33 +92,51 @@ pip install .
 ```bash
 conda create -y -n slurm_license_poller python=3
 conda activate slurm_license_poller
+cd poller
 pip install -e .
 ```
 
-## Configuration ([config.json](./config.json))
+## Configuration
 
 | Property | Default | Description |
 |---|---|---|
+| `$.type` | *(required)* | Instance type. "ibm-quantum-compute" or "ibm-quantum-system" |
+| `$.endpoint_url` | *(required)* | IBM Quantum System API endpoint URL. Required if type == "ibm-quantum-system" |
+| `$.iam_endpoint_url` | *(optional)* | IBM IAM API endpoint URL. Required if type == "ibm-quantum-system" |
 | `$.api_token` | *(required)* | API Token to access IBM Quantum Platform |
 | `$.service_crn` | *(required)* | Service CRN of your IBM Quantum Platform instance |
 | `$.backends` | *(required)* | A list of quantum backends to be monitored |
 | `$.poll_interval` | *(required)* | Polling interval of IBM Qiskit Runtime REST API calls, in seconds |
 | `$.cluster_name` | *(required)* | Slurm cluster where dynamic licenses are available |
 
+Examples:
+- [IBM Quantum Compute Service](./poller/config.json.example.iqc)
+- [IBM Quantum System Service](./poller/config.json.example.iqs)
+
+
+## Logging
+
+This program uses python standard logger. You can configure with [Configuration dictionary file](https://docs.python.org/3/library/logging.config.html#logging-config-dictschema). [An example](./poller/log_config.json.example) is available for your reference.
+
+
 ## Usage
 
 ### Starting the server
 
 ```bash
-usage: slurm-license-poller [-h] [--config CONFIG]
+usage: slurm-license-poller [-h] [--config CONFIG] [--log-level {DEBUG,INFO,WARNING,ERROR,CRITICAL}] [--log-config LOG_CONFIG]
 
 Slurm License Poller
 
 options:
-  -h, --help       show this help message and exit
-  --config CONFIG
+  -h, --help            show this help message and exit
+  --config CONFIG       config json file
+  --log-level {DEBUG,INFO,WARNING,ERROR,CRITICAL}
+                        Overrides the config file's log_level (default: INFO). Ignored if --log-config or the config's log_config is set.
+  --log-config LOG_CONFIG
+                        Path to a JSON logging.config.dictConfig file. Overrides --log-level and the config file's log_level entirely.
 ```
 
 ### Stopping the server
 
-<kbd>Ctrl</kbd>+<kbd>C</kbd>
+<kbd>Ctrl</kbd>+<kbd>C</kbd> or kill a process
