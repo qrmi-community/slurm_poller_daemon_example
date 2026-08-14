@@ -1,0 +1,11 @@
+{
+  "type": "ibm-quantum-system",
+  "endpoint_url": "<ibm quantum system api endpoint url>",
+  "api_token": "<your token>",
+  "service_crn": "<your instance>",
+  "backends": [
+    "ibm_rensselaer"
+  ],
+  "poll_interval": 30,
+  "cluster_name": "<your slurm cluster name>"
+}
