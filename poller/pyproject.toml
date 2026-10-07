@@ -2,7 +2,7 @@
 name = "slurm-license-poller"
 version = "0.1.0"
 dependencies = [
-  "qiskit-ibm-runtime",
+  "qrmi>=0.25.0",  # QuantumResource.status() / ResourceStatus.to_dict()
 ]
 requires-python = ">= 3.11"
 authors = [
@@ -11,10 +11,10 @@ authors = [
 maintainers = [
   {name = "Munetaka Ohtani", email = "ohtanim@jp.ibm.com"},
 ]
-description = "A poller daemon to update Slurm dynamic licenses based on the current status of IQP backends"
+description = "A poller daemon to update Slurm dynamic licenses based on the current status of QRMI quantum resources"
 readme = "README.md"
 license = "Apache-2.0"
-keywords = ["slurm", "qiskit", "qiskit-ibm-runtime"]
+keywords = ["slurm", "qrmi"]
 classifiers = [
   "Environment :: Console",
   "Operating System :: POSIX :: Linux",
@@ -34,3 +34,6 @@ dev = [
     "black",
     "ruff"
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

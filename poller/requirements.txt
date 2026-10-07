@@ -1,1 +1,1 @@
-qiskit-ibm-runtime
+qrmi>=0.25.0

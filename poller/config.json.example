@@ -1,0 +1,10 @@
+{
+  "config_path": "/etc/slurm/qrmi_config.json",
+  "resources": [
+    "test_heron"
+  ],
+  "poll_interval": 60,
+  "failure_threshold": 3,
+  "resync_interval": 300,
+  "sacctmgr_timeout": 30
+}
