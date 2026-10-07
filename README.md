@@ -1,10 +1,10 @@
 # slurm_license_poller (slp)
 
-A poller daemon that updates Slurm dynamic license counts based on the current status of IBM Quantum backends.
+A poller daemon that updates Slurm dynamic license counts based on the current status of quantum resources, as reported by [QRMI](https://github.com/qiskit-community/qrmi) (Quantum Resource Management Interface).
 
 It provides a reference implementation of the **Sensor pattern**: the state of a quantum system is monitored and fed into Slurm's scheduling decisions through [Slurm's Dynamic License mechanism](https://slurm.schedmd.com/licenses.html#dynamic_licenses). This demonstrates how Slurm scheduling can be coordinated with external quantum resource availability — when a quantum backend is occupied by another user, Slurm keeps the job in the `PENDING` state instead of allocating compute resources that would otherwise sit idle while waiting for quantum execution.
 
-Both the IBM Quantum Compute Service and the IBM Quantum System Service are supported.
+Any resource type supported by QRMI can be monitored (e.g. IBM Quantum Compute Service, IBM Quantum System Service, Pasqal Cloud, IQM Server); the resources themselves are defined in a QRMI config file.
 
 
 ## How it works
@@ -13,7 +13,7 @@ Slurm resources can be configured to require a license before a job may proceed.
 
 The workflow has three parts:
 
-1. **One license is defined per quantum backend**, with no changes to `slurm.conf` and no cluster restart required:
+1. **One license is defined per quantum backend**, with no changes to `slurm.conf` and no cluster restart required. The license name must be identical to the resource ID used in the QRMI config file and in this daemon's `resources` list:
 
    ```bash
    sacctmgr add resource name=ibm_kingston \
@@ -28,15 +28,23 @@ The workflow has three parts:
    sacctmgr show resource withcluster
    ```
 
-2. **`slurm_license_poller` runs as a daemon on one node in the cluster**, acting as the external license manager. It monitors each configured quantum backend, and when a backend becomes ready to execute jobs (its pending job count reaches zero), it uses the `sacctmgr` CLI to release the license by setting the consumed count back to `0`:
+2. **`slurm_license_poller` runs as a daemon on one node in the cluster**, acting as the external license manager. Every `poll_interval` seconds it queries the status of each configured resource through QRMI and uses the `sacctmgr` CLI to update the license:
 
    ```bash
    # Quantum backend is READY to accept the jobs
    sacctmgr -i update resource ibm_kingston set lastconsumed=0
 
-   # Quantum backend is BUSY
+   # Quantum backend is BUSY (or unavailable)
    sacctmgr -i update resource ibm_kingston set lastconsumed=1
    ```
+
+   A backend is considered **ready** only if QRMI reports it as `online` and it does not report itself as unhealthy (`healthy == false`) or busy (`busy == true`). Vendors that don't report `healthy`/`busy` are treated as ready whenever they are online. `offline` and `paused` backends are treated as busy.
+
+   The daemon is designed to **fail closed**, so jobs never run against a backend whose state is unknown:
+
+   - If the status of a backend can't be retrieved `failure_threshold` times in a row (e.g. network or authentication errors), its license is marked consumed until the status is available again.
+   - On shutdown (`SIGTERM` / `SIGINT`), every license is marked consumed, since nothing maintains it any more. Restarting the daemon releases the licenses of ready backends on its first poll.
+   - The license is written whenever the observed state changes, and re-written every `resync_interval` seconds even if it hasn't, so manual edits or a restored `slurmdbd` are corrected.
 
 3. **Users request the license in their `sbatch` invocation**:
 
@@ -74,17 +82,19 @@ Activate it (bash/zsh shown; see the [venv docs](https://docs.python.org/3/tutor
 source ~/.venvs/slurm-license-poller/bin/activate
 ```
 
-Upgrade pip — `pip>=25.1` is required for the `--group` feature used to manage developer dependency groups:
+Upgrade pip and install slp:
 
 ```bash
 pip install -U pip
-```
-
-Install slp along with the standard developer dependencies (testing, docs, linting):
-
-```bash
 cd poller
 pip install .
+```
+
+To also install the developer tools (pytest, black, ruff) and run the tests:
+
+```bash
+pip install -e ".[dev]"
+pytest
 ```
 
 ### Using Conda
@@ -100,18 +110,16 @@ pip install -e .
 
 | Property | Default | Description |
 |---|---|---|
-| `$.type` | *(required)* | Instance type. "ibm-quantum-compute" or "ibm-quantum-system" |
-| `$.endpoint_url` | *(required)* | IBM Quantum System API endpoint URL. Required if type == "ibm-quantum-system" |
-| `$.iam_endpoint_url` | *(optional)* | IBM IAM API endpoint URL. Required if type == "ibm-quantum-system" |
-| `$.api_token` | *(required)* | API Token to access IBM Quantum Platform |
-| `$.service_crn` | *(required)* | Service CRN of your IBM Quantum Platform instance |
-| `$.backends` | *(required)* | A list of quantum backends to be monitored |
-| `$.poll_interval` | *(required)* | Polling interval of IBM Qiskit Runtime REST API calls, in seconds |
-| `$.cluster_name` | *(required)* | Slurm cluster where dynamic licenses are available |
+| `$.config_path` | *(required)* | Path to the QRMI config file that defines the quantum resources (endpoints, credentials, etc.) |
+| `$.resources` | *(required)* | Non-empty list of QRMI resource IDs to monitor. Each ID is also used as the Slurm license name |
+| `$.poll_interval` | *(required)* | Polling interval, in seconds (> 0) |
+| `$.failure_threshold` | `3` | Number of consecutive status failures after which a backend's license is marked consumed |
+| `$.resync_interval` | `300` | Interval, in seconds, at which an unchanged license is re-written to Slurm |
+| `$.sacctmgr_timeout` | `30` | Timeout, in seconds, for each `sacctmgr` invocation |
+| `$.log_level` | `"INFO"` | Log level. Overridden by `--log-level`; ignored if a log config is used |
+| `$.log_config` | *(none)* | Path to a JSON `logging.config.dictConfig` file. Overridden by `--log-config` |
 
-Examples:
-- [IBM Quantum Compute Service](./poller/config.json.example.iqc)
-- [IBM Quantum System Service](./poller/config.json.example.iqs)
+Unknown keys are ignored with a warning. See [config.json.example](./poller/config.json.example) for an example.
 
 
 ## Logging
@@ -139,4 +147,4 @@ options:
 
 ### Stopping the server
 
-<kbd>Ctrl</kbd>+<kbd>C</kbd> or kill a process
+Press <kbd>Ctrl</kbd>+<kbd>C</kbd> or send `SIGTERM` (e.g. `systemctl stop`). The daemon finishes the backend it is currently polling, marks every license as consumed, and exits. A second signal aborts immediately.

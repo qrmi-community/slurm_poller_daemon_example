@@ -1,4 +1,4 @@
-"""A poller daemon to update Slurm dynamic license counts based on the current status of IBM Quantum backends"""
+"""Poller daemon that syncs Slurm dynamic licenses with the status of QRMI quantum resources."""
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -14,19 +14,37 @@ import logging
 import logging.config
 import signal
 import subprocess
+import threading
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
 
-import requests
-from ibm_cloud_sdk_core.authenticators import IAMAuthenticator
-from qiskit_ibm_runtime import QiskitRuntimeService, Session
-from qiskit_ibm_runtime.exceptions import IBMInputValueError
+# pylint: disable=no-name-in-module
+from qrmi import Config as QRMIConfig
+from qrmi import QuantumResource
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_LOG_LEVEL = "INFO"
+DEFAULT_FAILURE_THRESHOLD = 3
+DEFAULT_RESYNC_INTERVAL = 300.0
+DEFAULT_SACCTMGR_TIMEOUT = 30.0
+
+LICENSE_FREE = 0
+LICENSE_CONSUMED = 1
+
+
+class ConfigError(ValueError):
+    """Raised when the config file (or the logging config) is missing or malformed."""
+
+
+class ServiceInitError(RuntimeError):
+    """Raised when the quantum service cannot be initialized."""
+
+
+class BackendStatusError(RuntimeError):
+    """Raised when the status of a backend cannot be determined."""
 
 
 def configure_logging(
@@ -57,7 +75,9 @@ def configure_logging(
             with open(log_config_path, "r", encoding="utf-8") as f:
                 log_config = json.load(f)
             logging.config.dictConfig(log_config)
-        except (OSError, json.JSONDecodeError, ValueError) as e:
+        except (OSError, ValueError, TypeError, AttributeError, ImportError) as e:
+            # json.JSONDecodeError is a ValueError subclass. dictConfig may
+            # raise any of the others for a malformed schema.
             raise ConfigError(
                 f"Failed to apply log config '{log_config_path}': {e}"
             ) from e
@@ -76,21 +96,27 @@ def configure_logging(
     logging.getLogger().setLevel(level)  # in case basicConfig was already called
 
 
-# Keys required regardless of service type.
-COMMON_REQUIRED_KEYS = {"type", "service_crn", "api_token", "backends", "poll_interval"}
+def _require_type(raw: dict[str, Any], key: str, types: tuple[type, ...]) -> Any:
+    """Return raw[key] if it is an instance of types, otherwise raise ConfigError."""
+    value = raw[key]
+    # bool is a subclass of int; never accept it where a number is expected.
+    if isinstance(value, bool) or not isinstance(value, types):
+        expected = " or ".join(t.__name__ for t in types)
+        raise ConfigError(
+            f"Config key '{key}' must be of type {expected}, "
+            f"got {type(value).__name__}: {value!r}"
+        )
+    return value
 
-# Extra keys required for specific service types.
-TYPE_SPECIFIC_REQUIRED_KEYS: dict[str, set[str]] = {
-    "ibm-quantum-compute": set(),
-    "ibm-quantum-system": {"endpoint_url"},
-}
 
-# Default IAM endpoint used when a config doesn't specify iam_endpoint_url.
-DEFAULT_IAM_ENDPOINT_URL = "https://iam.cloud.ibm.com"
-
-
-class ConfigError(ValueError):
-    """Raised when the config file is missing or malformed."""
+def _positive_number(raw: dict[str, Any], key: str, default: float) -> float:
+    """Return raw[key] (or default) as a float, ensuring it is > 0."""
+    if key not in raw:
+        return default
+    value = float(_require_type(raw, key, (int, float)))
+    if value <= 0:
+        raise ConfigError(f"Config key '{key}' must be > 0, got {value!r}")
+    return value
 
 
 @dataclass
@@ -101,19 +127,29 @@ class Config:  # pylint: disable=too-many-instance-attributes
     count tracks the number of supported config keys rather than complexity.
     """
 
-    type: str
-    service_crn: str
-    api_token: str
-    backends: list[str]
+    config_path: str
+    resources: list[str]
     poll_interval: float
-    endpoint_url: str | None = None
-    iam_endpoint_url: str = DEFAULT_IAM_ENDPOINT_URL
+    failure_threshold: int = DEFAULT_FAILURE_THRESHOLD
+    resync_interval: float = DEFAULT_RESYNC_INTERVAL
+    sacctmgr_timeout: float = DEFAULT_SACCTMGR_TIMEOUT
     log_level: str = DEFAULT_LOG_LEVEL
     log_config: str | None = None
-    extra: dict[str, Any] = field(default_factory=dict)
+    unknown_keys: list[str] = field(default_factory=list)
+
+    REQUIRED_KEYS = frozenset({"config_path", "resources", "poll_interval"})
+    OPTIONAL_KEYS = frozenset(
+        {
+            "failure_threshold",
+            "resync_interval",
+            "sacctmgr_timeout",
+            "log_level",
+            "log_config",
+        }
+    )
 
     @classmethod
-    def from_file(cls, path: str) -> "Config":
+    def from_file(cls, path: str) -> Config:
         """Load and validate a config file.
 
         Args:
@@ -123,51 +159,73 @@ class Config:  # pylint: disable=too-many-instance-attributes
             A validated Config instance.
 
         Raises:
-            ConfigError: If the file is missing required keys or has an
-                unsupported service type.
+            ConfigError: If the file can't be read or parsed, is missing
+                required keys, or contains values of the wrong type/range.
         """
-        with open(path, "r", encoding="utf-8") as config_file:
-            raw: dict[str, Any] = json.load(config_file)
+        try:
+            with open(path, "r", encoding="utf-8") as config_file:
+                raw = json.load(config_file)
+        except (OSError, json.JSONDecodeError) as e:
+            raise ConfigError(f"Failed to read config file '{path}': {e}") from e
 
-        missing = COMMON_REQUIRED_KEYS - raw.keys()
+        if not isinstance(raw, dict):
+            raise ConfigError(f"Config file '{path}' must contain a JSON object")
+
+        missing = cls.REQUIRED_KEYS - raw.keys()
         if missing:
             raise ConfigError(
                 f"Missing required config keys: {', '.join(sorted(missing))}. "
                 f"Please check your config file: {path}"
             )
 
-        service_type = raw["type"]
-        if service_type not in TYPE_SPECIFIC_REQUIRED_KEYS:
-            supported = ", ".join(sorted(TYPE_SPECIFIC_REQUIRED_KEYS))
-            raise ConfigError(
-                f"Unsupported service type: {service_type}. Supported types: {supported}. "
-                f"Please check your config file: {path}"
-            )
+        config_path = _require_type(raw, "config_path", (str,))
 
-        type_missing = TYPE_SPECIFIC_REQUIRED_KEYS[service_type] - raw.keys()
-        if type_missing:
+        resources = _require_type(raw, "resources", (list,))
+        if not resources:
+            raise ConfigError("Config key 'resources' must not be empty")
+        if not all(isinstance(r, str) and r for r in resources):
             raise ConfigError(
-                f"Missing config keys required for type '{service_type}': "
-                f"{', '.join(sorted(type_missing))}. Please check your config file: {path}"
+                f"Config key 'resources' must be a list of non-empty strings, "
+                f"got {resources!r}"
             )
+        if len(set(resources)) != len(resources):
+            raise ConfigError(f"Config key 'resources' has duplicates: {resources!r}")
 
-        known_keys = COMMON_REQUIRED_KEYS | {
-            "endpoint_url",
-            "iam_endpoint_url",
-            "log_level",
-            "log_config",
-        }
+        poll_interval = _positive_number(raw, "poll_interval", 0.0)
+        resync_interval = _positive_number(
+            raw, "resync_interval", DEFAULT_RESYNC_INTERVAL
+        )
+        sacctmgr_timeout = _positive_number(
+            raw, "sacctmgr_timeout", DEFAULT_SACCTMGR_TIMEOUT
+        )
+
+        failure_threshold = DEFAULT_FAILURE_THRESHOLD
+        if "failure_threshold" in raw:
+            failure_threshold = _require_type(raw, "failure_threshold", (int,))
+            if failure_threshold < 1:
+                raise ConfigError(
+                    f"Config key 'failure_threshold' must be >= 1, "
+                    f"got {failure_threshold!r}"
+                )
+
+        log_level = DEFAULT_LOG_LEVEL
+        if "log_level" in raw:
+            log_level = _require_type(raw, "log_level", (str,))
+
+        log_config = None
+        if raw.get("log_config") is not None:
+            log_config = _require_type(raw, "log_config", (str,))
+
         return cls(
-            type=service_type,
-            service_crn=raw["service_crn"],
-            api_token=raw["api_token"],
-            backends=raw["backends"],
-            poll_interval=raw["poll_interval"],
-            endpoint_url=raw.get("endpoint_url"),
-            iam_endpoint_url=raw.get("iam_endpoint_url", DEFAULT_IAM_ENDPOINT_URL),
-            log_level=raw.get("log_level", DEFAULT_LOG_LEVEL),
-            log_config=raw.get("log_config"),
-            extra={k: v for k, v in raw.items() if k not in known_keys},
+            config_path=config_path,
+            resources=list(resources),
+            poll_interval=poll_interval,
+            failure_threshold=failure_threshold,
+            resync_interval=resync_interval,
+            sacctmgr_timeout=sacctmgr_timeout,
+            log_level=log_level,
+            log_config=log_config,
+            unknown_keys=sorted(raw.keys() - cls.REQUIRED_KEYS - cls.OPTIONAL_KEYS),
         )
 
 
@@ -175,238 +233,313 @@ class QuantumService(ABC):
     """Abstract base class for quantum service backends."""
 
     @abstractmethod
-    def is_busy(self, backend_name: str) -> bool | None:
-        """Check if a backend has an active dedicated session.
+    def is_busy(self, backend_name: str) -> bool:
+        """Check whether a backend is currently unavailable for new work.
 
         Args:
-            backend_name: Quantum backend name
+            backend_name: Quantum backend name. Must be one of the resources
+                the service was configured with.
 
         Returns:
-            True if busy, False if idle, None on error.
+            True if busy (or otherwise unavailable), False if idle.
+
+        Raises:
+            BackendStatusError: If the status could not be determined. The
+                caller decides how to handle the failure (e.g. retry, or
+                fail closed after repeated failures).
         """
 
 
-class IBMQuantumComputeService(QuantumService):
-    """IBM Quantum Platform (IQP) implementation of QuantumService."""
+class QRMI(QuantumService):
+    """QRMI implementation of QuantumService."""
 
-    def __init__(self, instance: str, token: str):
-        """Initialize the IQP service.
+    def __init__(self, config: Config):
+        """Initialize the QRMI service.
 
         Args:
-            instance: IBM Quantum Platform CRN instance
-            token: IBM Quantum Platform API token
+            config: Poller configuration
+
+        Raises:
+            ServiceInitError: If the QRMI config can't be loaded, a configured
+                resource is not defined in it, or a resource can't be created.
         """
-        self._service = QiskitRuntimeService(instance=instance, token=token)
-
-    def _is_dedicated_active_session(self, session_id: str) -> bool:
-        """Return True if the given session is an active dedicated session.
-
-        Args:
-            session_id: The Qiskit Runtime session id to check.
-
-        Returns:
-            True if the session is dedicated and active, otherwise False.
-        """
+        self._quantum_resource_map: dict[str, QuantumResource] = {}
         try:
-            session = Session.from_id(session_id, self._service)
-            details = session.details()
-            return details["mode"] == "dedicated" and details["state"] == "active"
-        except IBMInputValueError:
-            # Session.from_id() throws IBMInputValueError for batch mode jobs
-            return False
+            qrmi_config = QRMIConfig.load(config.config_path)
+        except Exception as e:  # pylint: disable=broad-except
+            # qrmi raises its own exception hierarchy (and OSError/ValueError
+            # from the native layer); all of them are fatal at startup.
+            raise ServiceInitError(
+                f"Failed to load QRMI config '{config.config_path}': {e}"
+            ) from e
 
-    def is_busy(self, backend_name: str) -> bool | None:
-        """Check if a backend has an active dedicated session. Returns None on error.
-
-        Args:
-            backend_name: Quantum backend name
-
-        Returns:
-            True if busy, False if idle, None on error.
-        """
-        try:
-            backend = self._service.backend(backend_name)
-            if backend.status().operational is False:
-                return True
-
-            jobs = self._service.jobs(limit=1, backend_name=backend_name)
-            if len(jobs) == 0:
-                return False
-
-            session_id = jobs[0].session_id
-            if session_id is None:
-                return False
-
-            return self._is_dedicated_active_session(session_id)
-
-        except Exception:  # pylint: disable=broad-except
-            # Broad catch is intentional: this runs in a long-lived poll loop and
-            # a single backend's transient failure must not crash the daemon.
-            logger.exception("Failed to obtain active session: %s", backend_name)
-            return None
-
-
-class IBMQuantumSystemService(QuantumService):
-    """IBM Quantum System implementation of QuantumService."""
-
-    def __init__(
-        self, instance: str, token: str, iam_endpoint_url: str, endpoint_url: str
-    ):
-        """Initialize the IQP service.
-
-        Args:
-            instance: IBM Quantum Platform CRN instance
-            token: IBM Quantum Platform API token
-            iam_endpoint_url: IAM authentication endpoint URL
-            endpoint_url: Backend status API endpoint URL
-        """
-        self._instance = instance
-        self._token = token
-        self._iam_endpoint_url = iam_endpoint_url
-        self._endpoint_url = endpoint_url
-        self._authenticator = IAMAuthenticator(token, url=iam_endpoint_url)
-
-    def is_busy(self, backend_name: str) -> bool | None:
-        """Check if a backend has an active dedicated session. Returns None on error.
-
-        Args:
-            backend_name: Quantum backend name
-
-        Returns:
-            True if busy, False if idle, None on error.
-        """
-        try:
-            access_token = self._authenticator.token_manager.get_token()
-            headers = {
-                "Authorization": f"Bearer {access_token}",
-                "Service-CRN": self._instance,
-            }
-            backend_details_url = f"{self._endpoint_url}/v1/backends/{backend_name}"
-            resp = requests.get(backend_details_url, headers=headers, timeout=10)
-
-            if resp.status_code != 200:
-                logger.error(
-                    "Backend status request failed for %s: HTTP %d %s",
-                    backend_name,
-                    resp.status_code,
-                    resp.text,
+        resource_map = qrmi_config.resource_map
+        for resource_id in config.resources:
+            if resource_id not in resource_map:
+                raise ServiceInitError(
+                    f"Resource '{resource_id}' is not defined in QRMI config "
+                    f"'{config.config_path}'. Defined resources: "
+                    f"{', '.join(sorted(resource_map)) or '(none)'}"
                 )
-                return None
+            res_def = resource_map[resource_id]
+            try:
+                self._quantum_resource_map[resource_id] = QuantumResource.from_config(
+                    res_def.name, res_def.resource_type, res_def.environment
+                )
+            except Exception as e:  # pylint: disable=broad-except
+                raise ServiceInitError(
+                    f"Failed to initialize QRMI resource '{resource_id}': {e}"
+                ) from e
 
-            resp_json = resp.json()
-            logger.debug(
-                "Backend status for %s: %s", backend_name, json.dumps(resp_json)
-            )
-            if resp_json["status"] != "online":
-                return True
-            if resp_json["locked"] is True:
-                return True
+    def is_busy(self, backend_name: str) -> bool:
+        """Check whether a backend is currently unavailable for new work.
 
-        except Exception:  # pylint: disable=broad-except
-            # Broad catch is intentional: this runs in a long-lived poll loop and
-            # a single backend's transient failure must not crash the daemon.
-            logger.exception("Failed to obtain active session: %s", backend_name)
-            return None
+        A backend is considered idle only if it is online and does not report
+        itself as unhealthy or busy. Vendors that don't report "healthy" or
+        "busy" leave those fields as None; None is treated as "no objection",
+        so such backends are idle whenever they are online. Offline and paused
+        backends are reported as busy so that Slurm keeps jobs pending.
 
-        return False
+        Args:
+            backend_name: Quantum backend name
+
+        Returns:
+            True if busy, False if idle.
+
+        Raises:
+            KeyError: If backend_name was not configured (a programming error).
+            BackendStatusError: If the status could not be retrieved.
+        """
+        res = self._quantum_resource_map[backend_name]
+        try:
+            status = res.status().to_dict()
+        except Exception as e:  # pylint: disable=broad-except
+            # Wrap whatever qrmi raises (network, auth, vendor API errors) so
+            # the caller only has to handle one exception type.
+            raise BackendStatusError(
+                f"Failed to obtain status of {backend_name}: {e}"
+            ) from e
+
+        logger.debug("Status of %s: %s", backend_name, status)
+        is_idle = (
+            status.get("status") == "online"
+            and status.get("healthy") in (True, None)
+            and status.get("busy") in (False, None)
+        )
+        return not is_idle
 
 
 def create_service(config: Config) -> QuantumService:
-    """Instantiate the appropriate QuantumService for the given config.
+    """Instantiate the QuantumService for the given config.
 
     Args:
         config: Validated poller configuration.
 
     Returns:
-        A QuantumService implementation matching config.type.
+        A QuantumService implementation.
+
+    Raises:
+        ServiceInitError: If the service can't be initialized.
     """
-    if config.type == "ibm-quantum-compute":
-        return IBMQuantumComputeService(
-            instance=config.service_crn,
-            token=config.api_token,
-        )
-    if config.type == "ibm-quantum-system":
-        return IBMQuantumSystemService(
-            instance=config.service_crn,
-            token=config.api_token,
-            endpoint_url=config.endpoint_url,
-            iam_endpoint_url=config.iam_endpoint_url,
-        )
-    # Config.from_file already validates config.type, so this should be unreachable.
-    raise ConfigError(f"Unsupported service type: {config.type}.")
+    return QRMI(config=config)
 
 
-def update_slurm_license(backend_name: str, is_busy: bool) -> bool:
-    """Update the Slurm dynamic license for a backend. Returns True on success.
+def update_slurm_license(backend_name: str, is_busy: bool, timeout: float) -> bool:
+    """Set the consumed count of a Slurm dynamic license.
 
     Args:
         backend_name: Quantum backend name (= Slurm license name)
-        is_busy: True if busy, otherwise False
+        is_busy: True to mark the license as consumed, False to release it.
+        timeout: Seconds to wait for sacctmgr before giving up.
 
     Returns:
         True if succeeded, otherwise False
     """
-    logger.info("Backend %s is %s", backend_name, "busy" if is_busy else "idle")
-    last_consumed = 1 if is_busy else 0
+    last_consumed = LICENSE_CONSUMED if is_busy else LICENSE_FREE
+    cmd = [
+        "sacctmgr",
+        "-i",
+        "update",
+        "resource",
+        backend_name,
+        "set",
+        f"lastconsumed={last_consumed}",
+    ]
+    logger.info("%s", cmd)
     try:
-        subprocess.run(
-            [
-                "sacctmgr",
-                "-i",
-                "update",
-                "resource",
-                backend_name,
-                "set",
-                f"lastconsumed={last_consumed}",
-            ],
-            check=True,
-        )
+        subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=timeout)
     except subprocess.CalledProcessError as e:
-        logger.exception(
-            "sacctmgr failed for %s: exit code %d", backend_name, e.returncode
+        logger.error(
+            "sacctmgr failed for %s (exit code %d): %s",
+            backend_name,
+            e.returncode,
+            (e.stderr or e.stdout or "").strip(),
         )
+        return False
+    except subprocess.TimeoutExpired:
+        logger.error("sacctmgr timed out after %.0fs for %s", timeout, backend_name)
+        return False
+    except OSError as e:
+        # e.g. sacctmgr not found in PATH, or not executable.
+        logger.error("Failed to run sacctmgr for %s: %s", backend_name, e)
         return False
 
     return True
 
 
-class ShutdownRequested(BaseException):
-    """Raised on SIGTERM so it unwinds blocking calls the same way KeyboardInterrupt does.
+@dataclass
+class _BackendState:
+    """Per-backend bookkeeping for the poller."""
 
-    Inherits from BaseException (not Exception) so it is not accidentally
-    swallowed by the services' broad `except Exception` handlers.
+    # Last value successfully written to Slurm (None = never written).
+    synced_busy: bool | None = None
+    # time.monotonic() of the last successful write.
+    synced_at: float = 0.0
+    consecutive_failures: int = 0
+
+
+class Poller:  # pylint: disable=too-many-instance-attributes
+    """Polls backend status and syncs Slurm dynamic licenses.
+
+    Policy:
+      * A license is written whenever the observed state changes, and
+        re-written every resync_interval seconds even if it hasn't, so that
+        manual edits or a restored slurmdbd are corrected.
+      * If a backend's status can't be determined failure_threshold times in
+        a row, the license is marked consumed (fail closed), so jobs don't run
+        against a backend whose state is unknown.
+      * On shutdown, every license is marked consumed, since nothing will
+        maintain it afterwards.
     """
 
-
-def _raise_shutdown_requested(_signum, _frame) -> None:
-    raise ShutdownRequested()
-
-
-class Poller:
-    """Polls backend status and syncs Slurm dynamic licenses."""
-
-    def __init__(
-        self, service: QuantumService, backends: list[str], poll_interval: float
+    def __init__(  # pylint: disable=too-many-arguments
+        self,
+        service: QuantumService,
+        backends: list[str],
+        poll_interval: float,
+        *,
+        failure_threshold: int = DEFAULT_FAILURE_THRESHOLD,
+        resync_interval: float = DEFAULT_RESYNC_INTERVAL,
+        sacctmgr_timeout: float = DEFAULT_SACCTMGR_TIMEOUT,
     ):
         self._service = service
         self._backends = backends
         self._poll_interval = poll_interval
-        self._prev_states: dict[str, bool | None] = dict.fromkeys(backends)
+        self._failure_threshold = failure_threshold
+        self._resync_interval = resync_interval
+        self._sacctmgr_timeout = sacctmgr_timeout
+        self._states = {backend: _BackendState() for backend in backends}
+        self._stop_event = threading.Event()
+
+    def stop(self) -> None:
+        """Request the poll loop to stop. Safe to call from a signal handler."""
+        self._stop_event.set()
+
+    @property
+    def stopping(self) -> bool:
+        """True once stop() has been called."""
+        return self._stop_event.is_set()
+
+    def _sync(self, backend: str, is_busy: bool, *, force: bool = False) -> None:
+        """Write the license for backend if needed, and record the result."""
+        state = self._states[backend]
+        now = time.monotonic()
+        changed = is_busy != state.synced_busy
+        stale = now - state.synced_at >= self._resync_interval
+        if not (force or changed or stale):
+            return
+
+        if changed:
+            logger.info("Backend %s is %s", backend, "busy" if is_busy else "idle")
+        else:
+            logger.debug(
+                "Re-syncing license of %s (%s)", backend, "busy" if is_busy else "idle"
+            )
+        if update_slurm_license(backend, is_busy, self._sacctmgr_timeout):
+            state.synced_busy = is_busy
+            state.synced_at = now
+
+    def _poll_backend(self, backend: str) -> None:
+        state = self._states[backend]
+        try:
+            is_busy = self._service.is_busy(backend)
+        except BackendStatusError as e:
+            state.consecutive_failures += 1
+            if state.consecutive_failures < self._failure_threshold:
+                logger.warning(
+                    "%s (failure %d/%d)",
+                    e,
+                    state.consecutive_failures,
+                    self._failure_threshold,
+                )
+                return
+            if state.consecutive_failures == self._failure_threshold:
+                logger.error(
+                    "%s; %d consecutive failures, marking license as consumed",
+                    e,
+                    state.consecutive_failures,
+                )
+            else:
+                logger.warning(
+                    "%s (failure %d, license kept consumed)",
+                    e,
+                    state.consecutive_failures,
+                )
+            is_busy = True
+        else:
+            if state.consecutive_failures >= self._failure_threshold:
+                logger.info(
+                    "Status of %s is available again after %d failures",
+                    backend,
+                    state.consecutive_failures,
+                )
+            state.consecutive_failures = 0
+
+        self._sync(backend, is_busy)
 
     def poll_once(self) -> None:
-        """Check every configured backend once and update licenses on change."""
+        """Check every configured backend once and update licenses as needed."""
         for backend in self._backends:
-            is_busy = self._service.is_busy(backend)
-            if is_busy is None or is_busy == self._prev_states[backend]:
-                continue
-            if update_slurm_license(backend, is_busy):
-                self._prev_states[backend] = is_busy
+            if self.stopping:
+                return
+            try:
+                self._poll_backend(backend)
+            except Exception:  # pylint: disable=broad-except
+                # Last line of defense: an unexpected bug for one backend must
+                # neither crash the daemon nor starve the other backends.
+                logger.exception("Unexpected error while polling %s", backend)
+
+    def lock_all(self) -> None:
+        """Mark every license as consumed. Used on shutdown."""
+        for backend in self._backends:
+            self._sync(backend, True, force=True)
 
     def run(self) -> None:
-        """Run the poll loop until interrupted by SIGINT/SIGTERM."""
-        while True:
+        """Run the poll loop until stop() is called."""
+        while not self.stopping:
             self.poll_once()
-            time.sleep(self._poll_interval)
+            self._stop_event.wait(self._poll_interval)
+
+
+def install_signal_handlers(poller: Poller) -> None:
+    """Make SIGINT/SIGTERM stop the poller gracefully.
+
+    The first signal asks the loop to stop after the current backend; the
+    handler only sets an event, so an in-flight QRMI call or sacctmgr update
+    is never torn down halfway. A second signal aborts whatever is running
+    (including the shutdown lock_all()) by raising SystemExit.
+
+    The handler deliberately does not log: logging from a signal handler can
+    interleave with, or re-enter, a log call already in progress.
+    """
+
+    def _handler(signum: int, _frame: Any) -> None:
+        if poller.stopping:
+            raise SystemExit(128 + signum)
+        poller.stop()
+
+    signal.signal(signal.SIGINT, _handler)
+    signal.signal(signal.SIGTERM, _handler)
 
 
 def parse_args() -> argparse.Namespace:
@@ -435,41 +568,62 @@ def main() -> None:
     """Main entry point."""
     args = parse_args()
 
-    # Configure logging as early as possible using just the CLI, so config
-    # load failures are still logged at a sensible level. Reconfigured below
-    # once the config file's log_level/log_config (if any) is known.
-    if args.log_config:
-        configure_logging(log_config_path=args.log_config)
-    else:
-        configure_logging(level_name=args.log_level or DEFAULT_LOG_LEVEL)
-
     try:
+        # Configure logging as early as possible using just the CLI, so config
+        # load failures are still logged at a sensible level. Reconfigured
+        # below once the config file's log_level/log_config (if any) is known.
+        if args.log_config:
+            configure_logging(log_config_path=args.log_config)
+        else:
+            configure_logging(level_name=args.log_level or DEFAULT_LOG_LEVEL)
+
         config = Config.from_file(args.config)
-    except (ConfigError, OSError, json.JSONDecodeError) as e:
-        logger.error("Failed to load config: %s", e)
+
+        if args.log_config:
+            pass  # CLI --log-config already applied and takes full precedence.
+        elif config.log_config:
+            configure_logging(log_config_path=config.log_config)
+        elif args.log_level is None:
+            configure_logging(level_name=config.log_level)
+    except ConfigError as e:
+        # Logging may not be configured if --log-config itself was bad;
+        # logging's last-resort handler still prints ERROR records to stderr.
+        logger.error("%s", e)
         raise SystemExit(1) from e
 
-    if args.log_config:
-        pass  # CLI --log-config already applied and takes full precedence.
-    elif config.log_config:
-        configure_logging(log_config_path=config.log_config)
-    elif args.log_level is None and config.log_level != DEFAULT_LOG_LEVEL:
-        configure_logging(level_name=config.log_level)
-
-    service = create_service(config)
-    poller = Poller(service, config.backends, config.poll_interval)
-
-    # Leave SIGINT on its default handler (raises KeyboardInterrupt) so Ctrl+C
-    # interrupts blocking calls (e.g. requests.get) immediately, same as before.
-    # Give SIGTERM the same behavior so systemd/slurm stop signals work too.
-    signal.signal(signal.SIGTERM, _raise_shutdown_requested)
+    if config.unknown_keys:
+        logger.warning(
+            "Ignoring unknown config keys: %s", ", ".join(config.unknown_keys)
+        )
 
     try:
+        service = create_service(config)
+    except ServiceInitError as e:
+        logger.error("%s", e)
+        raise SystemExit(1) from e
+
+    poller = Poller(
+        service,
+        config.resources,
+        config.poll_interval,
+        failure_threshold=config.failure_threshold,
+        resync_interval=config.resync_interval,
+        sacctmgr_timeout=config.sacctmgr_timeout,
+    )
+    install_signal_handlers(poller)
+
+    logger.info(
+        "Starting: resources=%s, poll_interval=%ss",
+        ", ".join(config.resources),
+        config.poll_interval,
+    )
+    try:
         poller.run()
-    except (KeyboardInterrupt, ShutdownRequested):
-        pass
+        logger.info("Shutdown requested.")
     finally:
-        logger.info("Shutting down.")
+        logger.info("Marking all licenses as consumed before exit.")
+        poller.lock_all()
+        logger.info("Shut down.")
 
 
 if __name__ == "__main__":
