@@ -107,7 +107,7 @@ function slurm_job_submit(job_desc, part_list, submit_uid)
             return license_error()
         end
         if count >= 1 then
-            have[name] = true
+            have[name] = count
         end
     end
 
@@ -123,6 +123,22 @@ function slurm_job_submit(job_desc, part_list, submit_uid)
         slurm.log_user("Error: --qpu=%s requires --licenses to include %s",
             qpu, table.concat(missing, ","))
         return license_error()
+    end
+
+    -- QRMI claims {host}_QRMI_JOB_QPU_SLOTS slots (default 1); it must match
+    -- the licenses Slurm grants, or Slurm's count of free slots is wrong.
+    -- Only batch jobs send their environment, so srun and salloc are not checked.
+    if job_desc.script then
+        for _, host in ipairs(split(qpu, ",")) do
+            local name = host:lower() .. "@" .. LICENSE_SERVER
+            local slots_var = host .. "_QRMI_JOB_QPU_SLOTS"
+            local slots = tonumber(job_desc.environment[slots_var] or "1")
+            if slots ~= have[name] then
+                slurm.log_user("Error: --licenses=%s:%d requires %s=%d",
+                    name, have[name], slots_var, have[name])
+                return license_error()
+            end
+        end
     end
 
     return slurm.SUCCESS

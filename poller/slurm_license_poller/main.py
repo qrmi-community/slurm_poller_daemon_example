@@ -233,15 +233,16 @@ class QuantumService(ABC):
     """Abstract base class for quantum service backends."""
 
     @abstractmethod
-    def is_busy(self, backend_name: str) -> bool:
-        """Check whether a backend is currently unavailable for new work.
+    def consumed_count(self, backend_name: str, total: int) -> int:
+        """Return how many of a backend's licenses are unavailable for new work.
 
         Args:
             backend_name: Quantum backend name. Must be one of the resources
                 the service was configured with.
+            total: Count of the backend's Slurm license.
 
         Returns:
-            True if busy (or otherwise unavailable), False if idle.
+            A count between 0 (idle) and total (busy or otherwise unavailable).
 
         Raises:
             BackendStatusError: If the status could not be determined. The
@@ -291,8 +292,8 @@ class QRMI(QuantumService):
                     f"Failed to initialize QRMI resource '{resource_id}': {e}"
                 ) from e
 
-    def is_busy(self, backend_name: str) -> bool:
-        """Check whether a backend is currently unavailable for new work.
+    def consumed_count(self, backend_name: str, total: int) -> int:
+        """Return how many of a backend's licenses are unavailable for new work.
 
         A backend is considered idle only if it is online and does not report
         itself as unhealthy or busy. Vendors that don't report "healthy" or
@@ -300,11 +301,17 @@ class QRMI(QuantumService):
         so such backends are idle whenever they are online. Offline and paused
         backends are reported as busy so that Slurm keeps jobs pending.
 
+        A busy backend consumes all total licenses. An idle backend consumes
+        none, unless its license has a count above 1 and QRMI reports its
+        capacity (e.g. Pasqal Warden QPU slots): then the licenses beyond the
+        available slots are consumed.
+
         Args:
             backend_name: Quantum backend name
+            total: Count of the backend's Slurm license.
 
         Returns:
-            True if busy, False if idle.
+            A count between 0 (idle) and total (busy).
 
         Raises:
             KeyError: If backend_name was not configured (a programming error).
@@ -326,7 +333,19 @@ class QRMI(QuantumService):
             and status.get("healthy") in (True, None)
             and status.get("busy") in (False, None)
         )
-        return not is_idle
+        if not is_idle:
+            return total
+        capacity = status.get("capacity")
+        if total == 1 or capacity is None:
+            return LICENSE_FREE
+        if capacity["max_slots"] != total:
+            logger.warning(
+                "%s reports %d slots, but its Slurm license count is %d",
+                backend_name,
+                capacity["max_slots"],
+                total,
+            )
+        return max(total - capacity["available_slots"], 0)
 
 
 def create_service(config: Config) -> QuantumService:
@@ -344,18 +363,49 @@ def create_service(config: Config) -> QuantumService:
     return QRMI(config=config)
 
 
-def update_slurm_license(backend_name: str, is_busy: bool, timeout: float) -> bool:
+def slurm_license_count(backend_name: str, timeout: float) -> int:
+    """Read the count of a Slurm dynamic license.
+
+    Args:
+        backend_name: Quantum backend name (= Slurm license name)
+        timeout: Seconds to wait for sacctmgr before giving up.
+
+    Returns:
+        The license count.
+
+    Raises:
+        ServiceInitError: If the license can't be read, or is not defined
+            exactly once.
+    """
+    cmd = ["sacctmgr", "-n", "-P", "show", "resource", backend_name, "format=Count"]
+    try:
+        result = subprocess.run(
+            cmd, check=True, capture_output=True, text=True, timeout=timeout
+        )
+    except (subprocess.SubprocessError, OSError) as e:
+        raise ServiceInitError(
+            f"Failed to read the count of Slurm license {backend_name}: {e}"
+        ) from e
+    counts = result.stdout.split()
+    if len(counts) != 1 or not counts[0].isdigit():
+        raise ServiceInitError(
+            f"Expected one Slurm license named {backend_name}, "
+            f"sacctmgr returned {result.stdout.strip()!r}"
+        )
+    return int(counts[0])
+
+
+def update_slurm_license(backend_name: str, last_consumed: int, timeout: float) -> bool:
     """Set the consumed count of a Slurm dynamic license.
 
     Args:
         backend_name: Quantum backend name (= Slurm license name)
-        is_busy: True to mark the license as consumed, False to release it.
+        last_consumed: Count of the license consumed outside Slurm.
         timeout: Seconds to wait for sacctmgr before giving up.
 
     Returns:
         True if succeeded, otherwise False
     """
-    last_consumed = LICENSE_CONSUMED if is_busy else LICENSE_FREE
     cmd = [
         "sacctmgr",
         "-i",
@@ -391,8 +441,10 @@ def update_slurm_license(backend_name: str, is_busy: bool, timeout: float) -> bo
 class _BackendState:
     """Per-backend bookkeeping for the poller."""
 
+    # Count of the backend's Slurm license.
+    total: int = LICENSE_CONSUMED
     # Last value successfully written to Slurm (None = never written).
-    synced_busy: bool | None = None
+    synced_consumed: int | None = None
     # time.monotonic() of the last successful write.
     synced_at: float = 0.0
     consecutive_failures: int = 0
@@ -406,10 +458,10 @@ class Poller:  # pylint: disable=too-many-instance-attributes
         re-written every resync_interval seconds even if it hasn't, so that
         manual edits or a restored slurmdbd are corrected.
       * If a backend's status can't be determined failure_threshold times in
-        a row, the license is marked consumed (fail closed), so jobs don't run
-        against a backend whose state is unknown.
-      * On shutdown, every license is marked consumed, since nothing will
-        maintain it afterwards.
+        a row, the license is marked fully consumed (fail closed), so jobs
+        don't run against a backend whose state is unknown.
+      * On shutdown, every license is marked fully consumed, since nothing
+        will maintain it afterwards.
     """
 
     def __init__(  # pylint: disable=too-many-arguments
@@ -421,6 +473,7 @@ class Poller:  # pylint: disable=too-many-instance-attributes
         failure_threshold: int = DEFAULT_FAILURE_THRESHOLD,
         resync_interval: float = DEFAULT_RESYNC_INTERVAL,
         sacctmgr_timeout: float = DEFAULT_SACCTMGR_TIMEOUT,
+        license_counts: dict[str, int] | None = None,
     ):
         self._service = service
         self._backends = backends
@@ -428,7 +481,11 @@ class Poller:  # pylint: disable=too-many-instance-attributes
         self._failure_threshold = failure_threshold
         self._resync_interval = resync_interval
         self._sacctmgr_timeout = sacctmgr_timeout
-        self._states = {backend: _BackendState() for backend in backends}
+        license_counts = license_counts or {}
+        self._states = {
+            backend: _BackendState(total=license_counts.get(backend, LICENSE_CONSUMED))
+            for backend in backends
+        }
         self._stop_event = threading.Event()
 
     def stop(self) -> None:
@@ -440,29 +497,31 @@ class Poller:  # pylint: disable=too-many-instance-attributes
         """True once stop() has been called."""
         return self._stop_event.is_set()
 
-    def _sync(self, backend: str, is_busy: bool, *, force: bool = False) -> None:
+    def _sync(self, backend: str, consumed: int, *, force: bool = False) -> None:
         """Write the license for backend if needed, and record the result."""
         state = self._states[backend]
         now = time.monotonic()
-        changed = is_busy != state.synced_busy
+        changed = consumed != state.synced_consumed
         stale = now - state.synced_at >= self._resync_interval
         if not (force or changed or stale):
             return
 
         if changed:
-            logger.info("Backend %s is %s", backend, "busy" if is_busy else "idle")
+            logger.info(
+                "Backend %s consumes %d/%d licenses", backend, consumed, state.total
+            )
         else:
             logger.debug(
-                "Re-syncing license of %s (%s)", backend, "busy" if is_busy else "idle"
+                "Re-syncing license of %s (%d/%d)", backend, consumed, state.total
             )
-        if update_slurm_license(backend, is_busy, self._sacctmgr_timeout):
-            state.synced_busy = is_busy
+        if update_slurm_license(backend, consumed, self._sacctmgr_timeout):
+            state.synced_consumed = consumed
             state.synced_at = now
 
     def _poll_backend(self, backend: str) -> None:
         state = self._states[backend]
         try:
-            is_busy = self._service.is_busy(backend)
+            consumed = self._service.consumed_count(backend, state.total)
         except BackendStatusError as e:
             state.consecutive_failures += 1
             if state.consecutive_failures < self._failure_threshold:
@@ -485,7 +544,7 @@ class Poller:  # pylint: disable=too-many-instance-attributes
                     e,
                     state.consecutive_failures,
                 )
-            is_busy = True
+            consumed = state.total
         else:
             if state.consecutive_failures >= self._failure_threshold:
                 logger.info(
@@ -495,7 +554,7 @@ class Poller:  # pylint: disable=too-many-instance-attributes
                 )
             state.consecutive_failures = 0
 
-        self._sync(backend, is_busy)
+        self._sync(backend, consumed)
 
     def poll_once(self) -> None:
         """Check every configured backend once and update licenses as needed."""
@@ -511,8 +570,8 @@ class Poller:  # pylint: disable=too-many-instance-attributes
 
     def lock_all(self) -> None:
         """Mark every license as consumed. Used on shutdown."""
-        for backend in self._backends:
-            self._sync(backend, True, force=True)
+        for backend, state in self._states.items():
+            self._sync(backend, state.total, force=True)
 
     def run(self) -> None:
         """Run the poll loop until stop() is called."""
@@ -598,6 +657,10 @@ def main() -> None:
 
     try:
         service = create_service(config)
+        license_counts = {
+            resource: slurm_license_count(resource, config.sacctmgr_timeout)
+            for resource in config.resources
+        }
     except ServiceInitError as e:
         logger.error("%s", e)
         raise SystemExit(1) from e
@@ -609,6 +672,7 @@ def main() -> None:
         failure_threshold=config.failure_threshold,
         resync_interval=config.resync_interval,
         sacctmgr_timeout=config.sacctmgr_timeout,
+        license_counts=license_counts,
     )
     install_signal_handlers(poller)
 

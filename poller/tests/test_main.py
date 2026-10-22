@@ -23,10 +23,10 @@ from slurm_license_poller import main as m
 class FakeService(m.QuantumService):
     """QuantumService whose answers are scripted per backend."""
 
-    def __init__(self, script: dict[str, list[bool | Exception]]):
+    def __init__(self, script: dict[str, list[int | Exception]]):
         self._script = {k: list(v) for k, v in script.items()}
 
-    def is_busy(self, backend_name: str) -> bool:
+    def consumed_count(self, backend_name: str, total: int) -> int:
         result = self._script[backend_name].pop(0)
         if isinstance(result, Exception):
             raise result
@@ -173,15 +173,42 @@ def make_qrmi(monkeypatch, tmp_path, resource):
         ({"status": "paused", "healthy": True, "busy": False}, True),
     ],
 )
-def test_qrmi_is_busy(monkeypatch, tmp_path, status, busy):
+def test_qrmi_consumed_count(monkeypatch, tmp_path, status, busy):
     svc = make_qrmi(monkeypatch, tmp_path, FakeResource(status=status))
-    assert svc.is_busy("a") is busy
+    assert svc.consumed_count("a", 1) == int(busy)
 
 
-def test_qrmi_is_busy_wraps_errors(monkeypatch, tmp_path):
+def slots(available, total=10):
+    return {"available_slots": available, "max_slots": total}
+
+
+@pytest.mark.parametrize(
+    "status, total, consumed",
+    [
+        ({"status": "online", "busy": False, "capacity": slots(4)}, 10, 6),
+        ({"status": "online", "busy": False, "capacity": slots(10)}, 10, 0),
+        ({"status": "online", "busy": True, "capacity": slots(0)}, 10, 10),
+        ({"status": "paused", "busy": False, "capacity": slots(10)}, 10, 10),
+        ({"status": "online", "busy": None, "capacity": None}, 10, 0),
+        ({"status": "offline", "busy": None, "capacity": None}, 10, 10),
+        # A license with count 1 stays binary, whatever the capacity.
+        ({"status": "online", "busy": False, "capacity": slots(1, 2)}, 1, 0),
+        # Slots and license count disagree: never offer more than available.
+        ({"status": "online", "busy": False, "capacity": slots(3, 4)}, 10, 7),
+        ({"status": "online", "busy": False, "capacity": slots(15, 20)}, 10, 0),
+    ],
+)
+def test_qrmi_consumed_count_from_capacity(
+    monkeypatch, tmp_path, status, total, consumed
+):
+    svc = make_qrmi(monkeypatch, tmp_path, FakeResource(status=status))
+    assert svc.consumed_count("a", total) == consumed
+
+
+def test_qrmi_consumed_count_wraps_errors(monkeypatch, tmp_path):
     svc = make_qrmi(monkeypatch, tmp_path, FakeResource(exc=RuntimeError("401")))
     with pytest.raises(m.BackendStatusError, match="401") as info:
-        svc.is_busy("a")
+        svc.consumed_count("a", 1)
     assert isinstance(info.value.__cause__, RuntimeError)
 
 
@@ -219,12 +246,44 @@ def test_qrmi_init_load_failure(monkeypatch, tmp_path):
 )
 def test_update_slurm_license_failures(sacctmgr, exc):
     sacctmgr.behaviour["raise"] = exc
-    assert m.update_slurm_license("a", True, timeout=30) is False
+    assert m.update_slurm_license("a", 1, timeout=30) is False
 
 
 def test_update_slurm_license_success(sacctmgr):
-    assert m.update_slurm_license("a", False, timeout=30) is True
-    assert sacctmgr.calls == [("a", 0)]
+    assert m.update_slurm_license("a", 0, timeout=30) is True
+    assert m.update_slurm_license("a", 7, timeout=30) is True
+    assert sacctmgr.calls == [("a", 0), ("a", 7)]
+
+
+def fake_sacctmgr_show(monkeypatch, stdout="", exc=None):
+    def fake_run(cmd, **kwargs):
+        assert cmd[3:6] == ["show", "resource", "a"]
+        if exc is not None:
+            raise exc
+        return subprocess.CompletedProcess(cmd, 0, stdout, "")
+
+    monkeypatch.setattr(m.subprocess, "run", fake_run)
+
+
+def test_slurm_license_count(monkeypatch):
+    fake_sacctmgr_show(monkeypatch, stdout="10\n")
+    assert m.slurm_license_count("a", timeout=30) == 10
+
+
+@pytest.mark.parametrize(
+    "stdout, exc, message",
+    [
+        ("", None, "Expected one Slurm license named a"),
+        ("10\n20\n", None, "Expected one Slurm license named a"),
+        (None, subprocess.CalledProcessError(1, "sacctmgr"), "Failed to read"),
+        (None, subprocess.TimeoutExpired("sacctmgr", 30), "Failed to read"),
+        (None, FileNotFoundError("sacctmgr"), "Failed to read"),
+    ],
+)
+def test_slurm_license_count_errors(monkeypatch, stdout, exc, message):
+    fake_sacctmgr_show(monkeypatch, stdout=stdout, exc=exc)
+    with pytest.raises(m.ServiceInitError, match=message):
+        m.slurm_license_count("a", timeout=30)
 
 
 # --------------------------------------------------------------------------
@@ -233,7 +292,7 @@ def test_update_slurm_license_success(sacctmgr):
 
 
 def test_poller_writes_only_on_change(sacctmgr, clock):
-    svc = FakeService({"a": [False, False, True, True, False]})
+    svc = FakeService({"a": [0, 0, 1, 1, 0]})
     poller = m.Poller(svc, ["a"], 10, resync_interval=1e9)
     for _ in range(5):
         poller.poll_once()
@@ -241,7 +300,7 @@ def test_poller_writes_only_on_change(sacctmgr, clock):
 
 
 def test_poller_resyncs_periodically(sacctmgr, clock):
-    svc = FakeService({"a": [False, False, False]})
+    svc = FakeService({"a": [0, 0, 0]})
     poller = m.Poller(svc, ["a"], 10, resync_interval=100)
     poller.poll_once()
     clock["t"] += 50
@@ -253,7 +312,7 @@ def test_poller_resyncs_periodically(sacctmgr, clock):
 
 def test_poller_fails_closed_after_threshold(sacctmgr, clock):
     err = m.BackendStatusError("down")
-    svc = FakeService({"a": [False, err, err, err, err, False]})
+    svc = FakeService({"a": [0, err, err, err, err, 0]})
     poller = m.Poller(svc, ["a"], 10, failure_threshold=3, resync_interval=1e9)
     for _ in range(6):
         poller.poll_once()
@@ -262,7 +321,7 @@ def test_poller_fails_closed_after_threshold(sacctmgr, clock):
 
 
 def test_poller_retries_failed_write(sacctmgr, clock):
-    svc = FakeService({"a": [False, False]})
+    svc = FakeService({"a": [0, 0]})
     poller = m.Poller(svc, ["a"], 10, resync_interval=1e9)
     sacctmgr.behaviour["raise"] = subprocess.TimeoutExpired("sacctmgr", 30)
     poller.poll_once()
@@ -272,20 +331,37 @@ def test_poller_retries_failed_write(sacctmgr, clock):
 
 
 def test_poller_isolates_unexpected_errors(sacctmgr, clock):
-    svc = FakeService({"a": [KeyError("bug")], "b": [False]})
+    svc = FakeService({"a": [KeyError("bug")], "b": [0]})
     poller = m.Poller(svc, ["a", "b"], 10)
     poller.poll_once()
     assert sacctmgr.calls == [("b", 0)]
 
 
 def test_poller_lock_all_and_stop(sacctmgr, clock):
-    svc = FakeService({"a": [False], "b": [True]})
+    svc = FakeService({"a": [0], "b": [1]})
     poller = m.Poller(svc, ["a", "b"], 10, resync_interval=1e9)
     poller.poll_once()
     poller.stop()
     poller.run()  # returns immediately once stopped
     poller.lock_all()
     assert sacctmgr.calls == [("a", 0), ("b", 1), ("a", 1), ("b", 1)]
+
+
+def test_poller_slot_license_fails_closed_to_its_count(sacctmgr, clock):
+    err = m.BackendStatusError("down")
+    svc = FakeService({"a": [3, 5, err, 0]})
+    poller = m.Poller(
+        svc,
+        ["a"],
+        10,
+        failure_threshold=1,
+        resync_interval=1e9,
+        license_counts={"a": 10},
+    )
+    for _ in range(4):
+        poller.poll_once()
+    poller.lock_all()
+    assert sacctmgr.calls == [("a", 3), ("a", 5), ("a", 10), ("a", 0), ("a", 10)]
 
 
 def test_main_exits_on_service_init_error(monkeypatch, tmp_path, sacctmgr):
@@ -298,3 +374,12 @@ def test_main_exits_on_service_init_error(monkeypatch, tmp_path, sacctmgr):
         m.main()
     assert info.value.code == 1
     assert sacctmgr.calls == []
+
+
+def test_main_exits_on_missing_license(monkeypatch, tmp_path):
+    monkeypatch.setattr(m, "create_service", lambda _cfg: FakeService({}))
+    fake_sacctmgr_show(monkeypatch, stdout="")
+    monkeypatch.setattr("sys.argv", ["slp", "--config", write_config(tmp_path)])
+    with pytest.raises(SystemExit) as info:
+        m.main()
+    assert info.value.code == 1
